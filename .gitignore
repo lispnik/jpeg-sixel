@@ -1,0 +1,7 @@
+*.fasl
+*.fas
+*.lx64fsl
+*.dx64fsl
+.DS_Store
+/systems/
+*.jpg
