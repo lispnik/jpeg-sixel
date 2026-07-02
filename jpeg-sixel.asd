@@ -26,3 +26,9 @@
   :components ((:file "test"))
   :perform (asdf:test-op (op c)
              (uiop:symbol-call :jpeg-sixel-test :run-tests)))
+
+(asdf:defsystem :jpeg-sixel/bench
+  :description "Performance benchmark for jpeg-sixel."
+  :depends-on (:jpeg-sixel)
+  :serial t
+  :components ((:file "bench")))

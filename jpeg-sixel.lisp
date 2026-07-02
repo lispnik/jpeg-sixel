@@ -1,6 +1,3 @@
-;;;; jpeg-sixel.lisp — convert a JPEG to a sixel string using cl-jpeg
-;;;; Dependencies: cl-jpeg only.  (asdf:load-system :cl-jpeg)
-
 (in-package :jpeg-sixel)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -18,7 +15,9 @@
 
 (defun channel-range (idxs r g b)
   "Return (values widest-channel rmin rmax gmin gmax bmin bmax)."
-  (declare (type (simple-array (unsigned-byte 8) (*)) r g b))
+  (declare #.*optimize*
+           (type (simple-array fixnum (*)) idxs)
+           (type (simple-array (unsigned-byte 8) (*)) r g b))
   (let ((rmn 255) (rmx 0) (gmn 255) (gmx 0) (bmn 255) (bmx 0))
     (declare (type (unsigned-byte 8) rmn rmx gmn gmx bmn bmx))
     (loop for i across idxs do
@@ -31,6 +30,46 @@
                     ((>= dg db) 1)
                     (t 2))
               rmn rmx gmn gmx bmn bmx))))
+
+(defun split-indices (idxs chan mid)
+  "Partition IDXS into (values lo hi): LO holds the MID indices with the
+   smallest CHAN value, HI the rest. Since CHAN is 8-bit we median-split with a
+   256-bucket counting sort (O(m)) instead of a comparison sort — ties at the
+   pivot value are apportioned so LO ends up exactly MID long, matching a
+   sort-then-split-at-MID. Returns fresh (simple-array fixnum) subvectors."
+  (declare #.*optimize*
+           (type (simple-array fixnum (*)) idxs)
+           (type (simple-array (unsigned-byte 8) (*)) chan)
+           (type fixnum mid))
+  (let ((hist (make-array 256 :element-type 'fixnum :initial-element 0))
+        (m (length idxs)))
+    (declare (type (simple-array fixnum (256)) hist) (type fixnum m))
+    (loop for i across idxs do (incf (aref hist (aref chan i))))
+    ;; pivot = value where the MID-th (0-based) element falls; BELOW = count of
+    ;; strictly smaller elements.
+    (let ((cum 0) (pivot 255) (below 0))
+      (declare (type fixnum cum pivot below))
+      (block find
+        (dotimes (v 256)
+          (declare (type fixnum v))
+          (let ((next (+ cum (the fixnum (aref hist v)))))
+            (declare (type fixnum next))
+            (when (> next mid) (setf pivot v below cum) (return-from find))
+            (setf cum next))))
+      (let ((lo (make-array mid :element-type 'fixnum))
+            (hi (make-array (- m mid) :element-type 'fixnum))
+            (li 0) (hj 0) (pivot-to-lo (- mid below)))
+        (declare (type (simple-array fixnum (*)) lo hi)
+                 (type fixnum li hj pivot-to-lo))
+        (loop for i across idxs do
+          (let ((v (aref chan i)))
+            (declare (type fixnum v))
+            (cond ((< v pivot) (setf (aref lo li) i) (incf li))
+                  ((> v pivot) (setf (aref hi hj) i) (incf hj))
+                  ((> pivot-to-lo 0)
+                   (setf (aref lo li) i) (incf li) (decf pivot-to-lo))
+                  (t (setf (aref hi hj) i) (incf hj)))))
+        (values lo hi)))))
 
 (defun median-cut (r g b npix ncolors)
   "Quantize to at most NCOLORS. Returns (values palette-vector index-array)."
@@ -52,15 +91,12 @@
           (unless target (return))
           (let ((idxs (vbox-indices target)))
             (multiple-value-bind (ch) (channel-range idxs r g b)
-              (let* ((chan (ecase ch (0 r) (1 g) (2 b)))
-                     (sorted (sort (copy-seq idxs) #'<
-                                   :key (lambda (i) (aref chan i))))
-                     (mid (floor (length sorted) 2))
-                     (lo (subseq sorted 0 mid))
-                     (hi (subseq sorted mid)))
-                (setf boxes (substitute-if (make-vbox lo)
-                                           (lambda (x) (eq x target)) boxes))
-                (push (make-vbox hi) boxes))))))
+              (let ((chan (ecase ch (0 r) (1 g) (2 b)))
+                    (mid (floor (length idxs) 2)))
+                (multiple-value-bind (lo hi) (split-indices idxs chan mid)
+                  (setf boxes (substitute-if (make-vbox lo)
+                                             (lambda (x) (eq x target)) boxes))
+                  (push (make-vbox hi) boxes)))))))
       ;; Build palette = average color of each box; assign indices.
       (let ((palette (make-array (length boxes)))
             (index (make-array npix :element-type '(unsigned-byte 8))))
@@ -166,23 +202,6 @@
                   (ash (ash ,gv -3) 5)
                   (ash ,bv -3))))
 
-(defun make-nearest-fn (palette)
-  "Return a closure (rv gv bv) -> palette slot, memoized in a 32^3 LUT."
-  (multiple-value-bind (pr pg pb) (palette->arrays palette)
-    (let ((ncolors (length palette))
-          (lut (make-array (* 32 32 32) :element-type 'fixnum
-                                        :initial-element -1)))
-      (declare (type (simple-array fixnum (*)) lut))
-      (lambda (rv gv bv)
-        (declare (type fixnum rv gv bv))
-        (let* ((k (lut-key rv gv bv))
-               (cached (aref lut k)))
-          (declare (type fixnum k cached))
-          (if (>= cached 0)
-              cached
-              (setf (aref lut k)
-                    (nearest-slot rv gv bv pr pg pb ncolors))))))))
-
 (declaim (inline clamp8))
 (defun clamp8 (x)
   (declare (type fixnum x))
@@ -192,65 +211,83 @@
   "Map each pixel to a palette slot. When DITHER, apply Floyd-Steinberg.
    Returns an (unsigned-byte 8) index array of length W*H.
    Note: dithering modifies working copies of r/g/b (error diffusion), not
-   the originals, so callers may reuse the source arrays."
-  (declare (type (simple-array (unsigned-byte 8) (*)) r g b)
+   the originals, so callers may reuse the source arrays.
+
+   Nearest-slot lookups are memoized in a 32^3 LUT keyed on the top 5 bits of
+   each channel; the lookup is a local INLINE flet (no per-pixel funcall) and
+   reuses the unpacked PR/PG/PB fixnum arrays both to search and to read back
+   the chosen color's components (no per-pixel consing)."
+  (declare #.*optimize*
+           (type (simple-array (unsigned-byte 8) (*)) r g b)
            (type fixnum w h))
-  (let ((nearest (make-nearest-fn palette))
-        (index (make-array (* w h) :element-type '(unsigned-byte 8))))
-    (if (not dither)
-        (dotimes (i (* w h))
-          (setf (aref index i)
-                (funcall nearest (aref r i) (aref g i) (aref b i))))
-        ;; Floyd-Steinberg: keep signed error-carrying working rows.
-        (multiple-value-bind (pr pg pb) (palette->arrays palette)
-          (declare (ignore pr pg pb))
-          (let* ((npix (* w h))
-                 ;; signed working buffers so error can push out of 0..255
-                 (wr (make-array npix :element-type 'fixnum))
-                 (wg (make-array npix :element-type 'fixnum))
-                 (wb (make-array npix :element-type 'fixnum)))
-            (declare (type (simple-array fixnum (*)) wr wg wb))
+  (multiple-value-bind (pr pg pb) (palette->arrays palette)
+    (let* ((ncolors (length palette))
+           (npix (* w h))
+           (lut (make-array (* 32 32 32) :element-type 'fixnum :initial-element -1))
+           (index (make-array npix :element-type '(unsigned-byte 8))))
+      (declare (type (simple-array fixnum (*)) pr pg pb lut)
+               (type fixnum ncolors npix))
+      (flet ((nearest (rv gv bv)
+               (declare (type fixnum rv gv bv))
+               (let* ((k (lut-key rv gv bv))
+                      (cached (aref lut k)))
+                 (declare (type fixnum k cached))
+                 (if (>= cached 0)
+                     cached
+                     (setf (aref lut k)
+                           (nearest-slot rv gv bv pr pg pb ncolors))))))
+        (declare (inline nearest))
+        (if (not dither)
             (dotimes (i npix)
-              (setf (aref wr i) (aref r i)
-                    (aref wg i) (aref g i)
-                    (aref wb i) (aref b i)))
-            (flet ((spread (i er eg eb num)
-                     (declare (type fixnum i er eg eb num))
-                     (incf (aref wr i) (ash (* er num) -4))
-                     (incf (aref wg i) (ash (* eg num) -4))
-                     (incf (aref wb i) (ash (* eb num) -4))))
-              (dotimes (y h)
-                (let ((left-to-right (evenp y))) ; serpentine scan
-                  (labels ((do-col (x)
-                             (declare (type fixnum x))
-                             (let* ((i (+ (* y w) x))
-                                    (rv (clamp8 (aref wr i)))
-                                    (gv (clamp8 (aref wg i)))
-                                    (bv (clamp8 (aref wb i)))
-                                    (slot (funcall nearest rv gv bv)))
-                               (setf (aref index i) slot)
-                               (multiple-value-bind (pr pg pb)
-                                   (values-list (aref palette slot))
-                                 (let ((er (- rv pr)) (eg (- gv pg)) (eb (- bv pb))
-                                       (dir (if left-to-right 1 -1)))
-                                   (declare (type fixnum er eg eb dir))
-                                   ;; right (7), below-left(3), below(5), below-right(1)
-                                   (let ((xr (+ x dir)))
-                                     (when (and (>= xr 0) (< xr w))
-                                       (spread (+ i dir) er eg eb 7)))
-                                   (when (< (1+ y) h)
-                                     (let ((bi (+ i w)))
-                                       (spread bi er eg eb 5)
-                                       (let ((xbl (- x dir)))
-                                         (when (and (>= xbl 0) (< xbl w))
-                                           (spread (- bi dir) er eg eb 3)))
-                                       (let ((xbr (+ x dir)))
-                                         (when (and (>= xbr 0) (< xbr w))
-                                           (spread (+ bi dir) er eg eb 1))))))))))
-                    (if left-to-right
-                        (loop for x fixnum from 0 below w do (do-col x))
-                        (loop for x fixnum from (1- w) downto 0 do (do-col x))))))))))
-    index))
+              (setf (aref index i)
+                    (nearest (aref r i) (aref g i) (aref b i))))
+            ;; Floyd-Steinberg: keep signed error-carrying working rows.
+            (let ((wr (make-array npix :element-type 'fixnum))
+                  (wg (make-array npix :element-type 'fixnum))
+                  (wb (make-array npix :element-type 'fixnum)))
+              (declare (type (simple-array fixnum (*)) wr wg wb))
+              (dotimes (i npix)
+                (setf (aref wr i) (aref r i)
+                      (aref wg i) (aref g i)
+                      (aref wb i) (aref b i)))
+              (flet ((spread (i er eg eb num)
+                       (declare (type fixnum i er eg eb num))
+                       (incf (aref wr i) (ash (* er num) -4))
+                       (incf (aref wg i) (ash (* eg num) -4))
+                       (incf (aref wb i) (ash (* eb num) -4))))
+                (declare (inline spread))
+                (dotimes (y h)
+                  (let ((left-to-right (evenp y))) ; serpentine scan
+                    (labels ((do-col (x)
+                               (declare (type fixnum x))
+                               (let* ((i (+ (* y w) x))
+                                      (rv (clamp8 (aref wr i)))
+                                      (gv (clamp8 (aref wg i)))
+                                      (bv (clamp8 (aref wb i)))
+                                      (slot (nearest rv gv bv))
+                                      (er (- rv (aref pr slot)))
+                                      (eg (- gv (aref pg slot)))
+                                      (eb (- bv (aref pb slot)))
+                                      (dir (if left-to-right 1 -1)))
+                                 (declare (type fixnum er eg eb dir))
+                                 (setf (aref index i) slot)
+                                 ;; right (7), below-left(3), below(5), below-right(1)
+                                 (let ((xr (+ x dir)))
+                                   (when (and (>= xr 0) (< xr w))
+                                     (spread (+ i dir) er eg eb 7)))
+                                 (when (< (1+ y) h)
+                                   (let ((bi (+ i w)))
+                                     (spread bi er eg eb 5)
+                                     (let ((xbl (- x dir)))
+                                       (when (and (>= xbl 0) (< xbl w))
+                                         (spread (- bi dir) er eg eb 3)))
+                                     (let ((xbr (+ x dir)))
+                                       (when (and (>= xbr 0) (< xbr w))
+                                         (spread (+ bi dir) er eg eb 1))))))))
+                      (if left-to-right
+                          (loop for x fixnum from 0 below w do (do-col x))
+                          (loop for x fixnum from (1- w) downto 0 do (do-col x))))))))))
+      index)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sixel emission.
@@ -262,6 +299,73 @@
   (cond ((<= count 0))
         ((<= count 3) (dotimes (_ count) (write-char ch out)))
         (t (write-char #\! out) (princ count out) (write-char ch out))))
+
+(defun emit-sixel (palette index w h)
+  "Encode INDEX (an (unsigned-byte 8) palette-slot array of length W*H) plus
+   PALETTE (vector of (r g b) lists) as a sixel string. Pure function of its
+   arguments — no decoding or scaling."
+  (declare #.*optimize*
+           (type (simple-array (unsigned-byte 8) (*)) index)
+           (type fixnum w h))
+  (let* ((ncolors (length palette))
+         ;; Reused per-color column masks: MASKS[color*w + col] holds the 6-bit
+         ;; sixel pattern for that color in the current band. Filled in one
+         ;; w*6 pass (rather than rescanning the band once per color), and each
+         ;; entry is zeroed again as it is emitted, so it stays all-zero between
+         ;; bands without a separate clear pass.
+         (masks (make-array (* ncolors w) :element-type '(unsigned-byte 8)
+                                          :initial-element 0))
+         (used (make-array ncolors :element-type 'bit :initial-element 0)))
+    (declare (type (simple-array (unsigned-byte 8) (*)) masks)
+             (type fixnum ncolors))
+    (with-output-to-string (out)
+      ;; Device Control String intro + raster attributes.
+      (format out "~cPq" #\Escape)
+      (format out "\"1;1;~d;~d" w h)
+      ;; Palette registers: sixel wants 0..100 scaled RGB, format 2 = RGB.
+      (loop for entry across palette for n fixnum from 0 do
+        (destructuring-bind (rr gg bb) entry
+          (format out "#~d;2;~d;~d;~d" n
+                  (round (* rr 100) 255)
+                  (round (* gg 100) 255)
+                  (round (* bb 100) 255))))
+      ;; Bands of 6 rows.
+      (loop for band-top fixnum from 0 below h by 6 do
+        (let ((band-h (min 6 (- h band-top))))
+          (declare (type (integer 1 6) band-h))
+          (fill used 0)
+          ;; Single pass: OR each pixel's row-bit into its color's column mask.
+          (dotimes (row band-h)
+            (let ((base (the fixnum (* (+ band-top row) w)))
+                  (bit (the (unsigned-byte 6) (ash 1 row))))
+              (dotimes (col w)
+                (let* ((color (aref index (+ base col)))
+                       (mi (the fixnum (+ (the fixnum (* color w)) col))))
+                  (setf (sbit used color) 1)
+                  (setf (aref masks mi) (logior (aref masks mi) bit))))))
+          ;; One output pass per used color; clear its masks as we read them.
+          (let ((first-pass t))
+            (dotimes (color ncolors)
+              (when (= 1 (sbit used color))
+                (unless first-pass (write-char #\$ out)) ; CR between passes
+                (setf first-pass nil)
+                (format out "#~d" color)
+                (let ((coff (the fixnum (* color w)))
+                      (run-char nil) (run-len 0))
+                  (declare (type fixnum run-len))
+                  (dotimes (col w)
+                    (let* ((mi (+ coff col))
+                           (mask (aref masks mi))
+                           (c (code-char (+ 63 mask))))
+                      (setf (aref masks mi) 0) ; reset for the next band
+                      (if (eql c run-char)
+                          (incf run-len)
+                          (progn (when run-char (emit-run out run-char run-len))
+                                 (setf run-char c run-len 1)))))
+                  (when run-char (emit-run out run-char run-len))))))
+          (write-char #\- out)))            ; newline: next band
+      ;; String Terminator.
+      (format out "~c\\" #\Escape))))
 
 (defun jpeg->sixel (filename &key (max-colors 256) (dither t)
                              max-width max-height cols)
@@ -313,51 +417,7 @@
         (let ((index (if dither
                          (map-pixels r g b w h palette :dither t)
                          raw-index)))
-        (with-output-to-string (out)
-          ;; Device Control String intro + raster attributes.
-          (format out "~cPq" #\Escape)
-          (format out "\"1;1;~d;~d" w h)
-          ;; Palette registers: sixel wants 0..100 scaled RGB, format 2 = RGB.
-          (loop for entry across palette for n fixnum from 0 do
-            (destructuring-bind (rr gg bb) entry
-              (format out "#~d;2;~d;~d;~d" n
-                      (round (* rr 100) 255)
-                      (round (* gg 100) 255)
-                      (round (* bb 100) 255))))
-          ;; Bands of 6 rows.
-          (let ((ncolors (length palette)))
-            (loop for band-top fixnum from 0 below h by 6 do
-              (let ((band-h (min 6 (- h band-top)))
-                    (used (make-array ncolors :element-type 'bit :initial-element 0)))
-                ;; Which palette slots appear in this band?
-                (dotimes (row band-h)
-                  (let ((base (* (+ band-top row) w)))
-                    (dotimes (col w)
-                      (setf (sbit used (aref index (+ base col))) 1))))
-                ;; One pass per used color.
-                (let ((first-pass t))
-                  (dotimes (color ncolors)
-                    (when (= 1 (sbit used color))
-                      (unless first-pass (write-char #\$ out)) ; CR between passes
-                      (setf first-pass nil)
-                      (format out "#~d" color)
-                      ;; Build this color's sixel byte per column, with RLE.
-                      (let ((run-char nil) (run-len 0))
-                        (dotimes (col w)
-                          (let ((mask 0))
-                            (declare (type (unsigned-byte 6) mask))
-                            (dotimes (row band-h)
-                              (when (= color (aref index (+ (* (+ band-top row) w) col)))
-                                (setf mask (logior mask (ash 1 row)))))
-                            (let ((c (code-char (+ 63 mask))))
-                              (if (eql c run-char)
-                                  (incf run-len)
-                                  (progn (when run-char (emit-run out run-char run-len))
-                                         (setf run-char c run-len 1))))))
-                        (when run-char (emit-run out run-char run-len))))))
-                (write-char #\- out))))           ; newline: next band
-          ;; String Terminator.
-          (format out "~c\\" #\Escape)))))))
+          (emit-sixel palette index w h))))))
 
 (defun write-jpeg-sixel (filename &optional (stream *standard-output*)
                          &rest keys &key &allow-other-keys)
