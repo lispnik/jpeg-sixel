@@ -67,11 +67,11 @@
          out
          (> (length (string-trim '(#\Newline #\Return #\Space) out)) 0))))
 
-(defun %read-reply (timeout-decisec)
+(defun %read-reply (timeout-decisec &optional (terminator #\t))
   "Read a CSI reply from *standard-input* with a coarse timeout.
    Relies on stty min 0 time N having been set so reads are non-blocking-ish.
-   Collects bytes until the terminating letter 't' or a short idle. Returns the
-   raw string (including the leading ESC) or NIL."
+   Collects bytes until TERMINATOR or a short idle. Returns the raw string
+   (including the leading ESC) or NIL."
   (let ((buf (make-string-output-stream))
         (deadline (+ (get-internal-real-time)
                      (* timeout-decisec (/ internal-time-units-per-second 10))))
@@ -85,7 +85,7 @@
               ((eq c :eof) (return))
               (t (setf got t)
                  (write-char c buf)
-                 (when (char= c #\t) (return))))))
+                 (when (char= c terminator) (return))))))
     (and got (get-output-stream-string buf))))
 
 (defun %parse-csi-t (reply)
@@ -135,3 +135,47 @@
    spans, using a live cell-size probe when possible, else DEFAULT-CELL-W."
   (let ((cw (or (nth-value 0 (query-cell-size)) default-cell-w)))
     (max 1 (floor target-px cw))))
+
+;;; --- sixel capability via Primary Device Attributes ------------------------
+;;;
+;;; ESC [ c  requests Primary DA. The reply is  ESC [ ? p1 ; p2 ; ... c
+;;; where each pN is a feature code. Code 4 = sixel graphics.
+
+(defun %parse-da-features (reply)
+  "Parse a Primary DA reply (ESC [ ? n;n;...c) into a list of integer feature
+   codes, or NIL if REPLY is not a well-formed DA response."
+  (when (and reply (find #\c reply))
+    (let* ((qpos (position #\? reply))
+           (cpos (position #\c reply))
+           (body (and qpos cpos (< qpos cpos) (subseq reply (1+ qpos) cpos))))
+      (when body
+        (let ((codes '()) (start 0))
+          (loop
+            (let ((sep (position #\; body :start start)))
+              (let ((tok (subseq body start (or sep (length body)))))
+                (let ((n (parse-integer tok :junk-allowed t)))
+                  (when n (push n codes))))
+              (if sep (setf start (1+ sep)) (return))))
+          (nreverse codes))))))
+
+(defun sixel-supported-p (&key (timeout-decisec 3))
+  "Return T if the terminal's Primary Device Attributes report sixel support
+   (feature code 4), NIL if it does not, and :UNKNOWN if we can't tell (no tty,
+   no reply, or a malformed response). Never blocks beyond TIMEOUT-DECISEC."
+  (unless (%tty-p)
+    (return-from sixel-supported-p :unknown))
+  (let ((saved (nth-value 0 (%run "stty" '("-g")))))
+    (unless saved (return-from sixel-supported-p :unknown))
+    (setf saved (string-trim '(#\Newline #\Return) saved))
+    (unwind-protect
+         (progn
+           (unless (%stty (format nil "-icanon -echo min 0 time ~d" timeout-decisec))
+             (return-from sixel-supported-p :unknown))
+           (format *standard-output* "~c[c" #\Escape)
+           (finish-output *standard-output*)
+           (let ((features (%parse-da-features
+                            (%read-reply timeout-decisec #\c))))
+             (cond ((null features) :unknown)
+                   ((member 4 features) t)
+                   (t nil))))
+      (when saved (%stty (format nil "~a" saved))))))

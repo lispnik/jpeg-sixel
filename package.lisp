@@ -12,4 +12,5 @@
    #:write-jpeg-sixel
    ;; terminal probe
    #:query-cell-size
-   #:columns-for-width))
+   #:columns-for-width
+   #:sixel-supported-p))

@@ -97,7 +97,17 @@
                     "query-cell-size returns NIL NIL with no tty")
              ;; 5. columns-for-width falls back cleanly
              (check (= 120 (jpeg-sixel:columns-for-width 1200 :default-cell-w 10))
-                    "columns-for-width fallback")))
+                    "columns-for-width fallback")
+             ;; 6. sixel-supported-p is safe in batch (no tty) -> :unknown
+             (check (eq :unknown (jpeg-sixel:sixel-supported-p :timeout-decisec 2))
+                    "sixel-supported-p returns :unknown with no tty")
+             ;; 7. DA parser recognizes / rejects the sixel feature code
+             (check (member 4 (jpeg-sixel::%parse-da-features
+                               (format nil "~c[?62;4;6;22c" #\Escape)))
+                    "DA parser finds sixel code 4")
+             (check (not (member 4 (jpeg-sixel::%parse-da-features
+                                    (format nil "~c[?62;22c" #\Escape))))
+                    "DA parser rejects when 4 absent")))
       (ignore-errors (delete-file tmp)))
     (format t "~&~[All tests passed.~:;~:*~d failure(s).~]~%" *failures*)
     (when (> *failures* 0)

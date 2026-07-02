@@ -31,6 +31,21 @@ recent VTE terminals). Built on [cl-jpeg](https://github.com/sharplispers/cl-jpe
 (jpeg-sixel:jpeg->sixel "photo.jpg" :max-width 400 :max-colors 128 :dither t)
 ```
 
+### Detecting sixel support
+
+Before emitting, you can ask the terminal whether it supports sixel via its
+Primary Device Attributes:
+
+```lisp
+(jpeg-sixel:sixel-supported-p)
+;; => T         terminal reports sixel (DA feature code 4)
+;; => NIL       terminal answered, but without sixel
+;; => :UNKNOWN  no tty, no reply, or a malformed response
+```
+
+Treat `:UNKNOWN` as "proceed if you like, but I couldn't confirm" rather than a
+hard no — some terminals support sixel without advertising it in DA.
+
 Note: the escape sequence must reach the actual terminal stream. From a SLIME
 REPL the bytes will not render; direct it at the tty.
 
