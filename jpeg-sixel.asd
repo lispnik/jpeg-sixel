@@ -4,7 +4,7 @@
   :name "jpeg-sixel"
   :version "0.1.0"
   :license "MIT"
-  :author "Matthew"
+  :author "Matthew Kennedy <burnsidemk@gmail.com>"
   :description "Convert JPEG images to sixel escape sequences for terminal display."
   :long-description
   "A small, dependency-light JPEG-to-sixel encoder built on cl-jpeg. Handles
